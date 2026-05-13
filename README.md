@@ -19,6 +19,8 @@ Finally the project includes a docker setup to create a specific docker image an
 
 Initially a fork of https://github.com/lionelpere/azure-devops-repository-backup, most of ideas and bash main script taken from it.
 
+Modified by Aukjan van Belkum, 2026
+
 ## :bullettrain_side: Azure DevOps pipeline
 
 The `azure-pipelines.yml` file is ready to be used as azure devops yaml pipeline. It is required a linux host with azure devops agent installed.
