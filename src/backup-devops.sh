@@ -575,7 +575,9 @@ function export_artifacts {
   local project_id="${2}"
   local project_name="${3}"
   local artifacts_dir="${BACKUP_DIRECTORY}/${project_dir_name}/artifacts"
-  local api_base="${ORGANIZATION}"
+  # Packaging API lives on feeds.dev.azure.com
+  local org_name="${ORGANIZATION##*/}"
+  local api_base="https://feeds.dev.azure.com/${org_name}"
   local auth_header="Authorization: Basic ${B64_PAT}"
 
   echo "====> Exporting artifacts for project [${project_name}]"
@@ -681,14 +683,12 @@ function export_artifacts {
       }
 
       if retry "versions for [${pkg_name}] in [${feed_name}]" fetch_versions; then
-        local versions_data
-        versions_data=$(jq -c '.' "${tmp_response}")
-        # Combine package info with versions
-        echo "${pkg_json}" | jq -c --argjson versions "${versions_data}" '. + {versions: $versions.value}' >> "${packages_output}"
+        # Combine package info with versions (use slurpfile to avoid arg list too long)
+        echo "${pkg_json}" | jq -c --slurpfile versions "${tmp_response}" '. + {versions: $versions[0].value}' >> "${packages_output}"
 
         # Download latest version binary
         local latest_version
-        latest_version=$(echo "${versions_data}" | jq -r '.value[0].version // empty')
+        latest_version=$(jq -r '.value[0].version // empty' "${tmp_response}")
 
         if [[ -n "${latest_version}" ]]; then
           local binary_dir="${artifacts_dir}/binaries/${safe_feed_name}/${safe_pkg_name}/${latest_version}"
@@ -791,7 +791,9 @@ function export_artifacts {
 # usage: export_artifacts_org
 function export_artifacts_org {
   local artifacts_dir="${BACKUP_DIRECTORY}/_organization/artifacts"
-  local api_base="${ORGANIZATION}"
+  # Org-scoped packaging API lives on feeds.dev.azure.com
+  local org_name="${ORGANIZATION##*/}"
+  local api_base="https://feeds.dev.azure.com/${org_name}"
   local auth_header="Authorization: Basic ${B64_PAT}"
 
   echo "=== Exporting org-scoped artifact feeds"
@@ -896,12 +898,11 @@ function export_artifacts_org {
       }
 
       if retry "versions for [${pkg_name}] in org feed [${feed_name}]" fetch_versions; then
-        local versions_data
-        versions_data=$(jq -c '.' "${tmp_response}")
-        echo "${pkg_json_line}" | jq -c --argjson versions "${versions_data}" '. + {versions: $versions.value}' >> "${packages_output}"
+        # Combine package info with versions (use slurpfile to avoid arg list too long)
+        echo "${pkg_json_line}" | jq -c --slurpfile versions "${tmp_response}" '. + {versions: $versions[0].value}' >> "${packages_output}"
 
         local latest_version
-        latest_version=$(echo "${versions_data}" | jq -r '.value[0].version // empty')
+        latest_version=$(jq -r '.value[0].version // empty' "${tmp_response}")
 
         if [[ -n "${latest_version}" ]]; then
           local binary_dir="${artifacts_dir}/binaries/${safe_feed_name}/${safe_pkg_name}/${latest_version}"
@@ -1148,7 +1149,7 @@ if [[ -n "${PROJECT_FILTER}" ]]; then
     fi
   done
   # Filter project list (case-insensitive match)
-  FilteredProjectList=$(echo "${ProjectList}" | jq --argjson names "[${local_filter}]" '[.[] | select(any($names[]; ascii_downcase == (.name | ascii_downcase)))]')
+  FilteredProjectList=$(echo "${ProjectList}" | jq --argjson names "[${local_filter}]" '[.[] | . as $proj | select(any($names[]; ascii_downcase == ($proj.name | ascii_downcase)))]')
   filtered_count=$(echo "${FilteredProjectList}" | jq 'length')
   if [[ "${filtered_count}" -eq 0 ]]; then
     die "ERROR: no projects matched filter [${PROJECT_FILTER}]. Available projects: $(echo "${ProjectList}" | jq -r '.[].name' | tr '\n' ', ')"
