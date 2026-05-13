@@ -15,6 +15,9 @@ services:
       - WIKI=true
       - NOCOMPRESS=true
       - BACKLOG=false
+      - PIPELINES=false
+      - ARTIFACTS=false
+      - PROJECT_FILTER
       - VERBOSE=false
     volumes:
       - ../../backups:/data
@@ -35,6 +38,49 @@ services:
       - NOCOMPRESS=true
       - BACKLOG=true
       - SKIP_REPOS=true
+      - PROJECT_FILTER
+      - VERBOSE=false
+    volumes:
+      - ../../backups:/data
+
+  pipelines:
+    container_name: adorepobck-pipelines
+    image: adorepobck:latest
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DEVOPS_ORG_URL
+      - DEVOPS_PAT
+      - RETENTION_DAYS=1
+      - DRY_RUN=false
+      - WIKI=false
+      - NOCOMPRESS=true
+      - PIPELINES=true
+      - SKIP_REPOS=true
+      - PROJECT_FILTER
+      - VERBOSE=false
+    volumes:
+      - ../../backups:/data
+
+  artifacts:
+    container_name: adorepobck-artifacts
+    image: adorepobck:latest
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DEVOPS_ORG_URL
+      - DEVOPS_PAT
+      - RETENTION_DAYS=1
+      - DRY_RUN=false
+      - WIKI=false
+      - NOCOMPRESS=true
+      - ARTIFACTS=true
+      - SKIP_REPOS=true
+      - PROJECT_FILTER
       - VERBOSE=false
     volumes:
       - ../../backups:/data
