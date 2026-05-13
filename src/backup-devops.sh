@@ -15,6 +15,9 @@ COMPRESS=true
 PROJECT_WIKI=false;
 BACKLOG=false;
 SKIP_REPOS=false;
+PIPELINES=false;
+ARTIFACTS=false;
+PROJECT_FILTER="";
 
 # required options
 PAT=""
@@ -52,7 +55,7 @@ function die_and_usage {
 
 # usage function
 function usage {
-  usage="$(basename "$0") [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s]
+  usage="$(basename "$0") [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-f projects]
 where:
     -h  show this help text
     -p  personal access token (PAT) for Azure DevOps [REQUIRED]
@@ -65,7 +68,10 @@ where:
     -w  backup project wiki [default is false]
     -n  do not compress backup folder [default is true]
     -b  backup backlog work items (exports via REST API as JSON) [default is false]
-    -s  skip repository cloning (use with -b for backlog-only mode) [default is false]"
+    -s  skip repository cloning (use with -b/-l/-a for metadata-only mode) [default is false]
+    -l  backup pipeline definitions (YAML + classic as JSON) [default is false]
+    -a  backup artifact feeds, packages and binaries [default is false]
+    -f  filter projects: comma-separated list of project names to backup [default is all]"
   printf '%s\n' "${usage}"
 }
 
@@ -374,6 +380,619 @@ function export_backlog {
   return 0
 }
 
+# export pipeline definitions for a project via Azure DevOps REST API
+# Exports both YAML pipelines and classic build definitions as JSON.
+# usage: export_pipelines <normalized_project_name> <project_id> <original_project_name>
+function export_pipelines {
+  local project_dir_name="${1}"
+  local project_id="${2}"
+  local project_name="${3}"
+  local pipelines_dir="${BACKUP_DIRECTORY}/${project_dir_name}/pipelines"
+  local api_base="${ORGANIZATION}"
+  local auth_header="Authorization: Basic ${B64_PAT}"
+
+  echo "====> Exporting pipelines for project [${project_name}]"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "====> Simulate pipeline export for [${project_name}] to ${pipelines_dir}"
+    return 0
+  fi
+
+  mkdir -p "${pipelines_dir}"
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "${pipelines_dir}/.export_tmp.XXXXXX")
+  trap "rm -rf '${tmp_dir}'" RETURN
+
+  local tmp_response="${tmp_dir}/response.json"
+
+  # ── Step 1: Export YAML pipelines ──
+  local all_pipelines="${tmp_dir}/all_pipelines.jsonl"
+  > "${all_pipelines}"
+  local continuation_token=""
+  local page=0
+
+  while true; do
+    ((page++))
+    local url="${api_base}/${project_id}/_apis/pipelines?api-version=7.1"
+    [[ -n "${continuation_token}" ]] && url="${url}&continuationToken=${continuation_token}"
+
+    fetch_pipelines_page() {
+      safe_curl "${tmp_response}" \
+        -H "${auth_header}" \
+        "${url}"
+    }
+
+    if ! retry "pipelines list page ${page} for [${project_name}]" fetch_pipelines_page; then
+      echo "====> WARNING: failed to list pipelines for [${project_name}] (page ${page}), skipping"
+      return 1
+    fi
+
+    local page_count
+    page_count=$(jq '.value | length' "${tmp_response}")
+    jq -c '.value[]' "${tmp_response}" >> "${all_pipelines}"
+
+    echo "====> Pipelines page ${page}: got ${page_count} definitions"
+
+    # Check for continuation token
+    continuation_token=$(jq -r '.continuationToken // empty' "${tmp_response}")
+    if [[ -z "${continuation_token}" || "${page_count}" -eq 0 ]]; then
+      break
+    fi
+  done
+
+  # Fetch full details for each pipeline
+  local pipeline_details="${tmp_dir}/pipeline_details.jsonl"
+  > "${pipeline_details}"
+  local pipeline_count=0
+
+  while IFS= read -r pipeline_json; do
+    [[ -z "${pipeline_json}" ]] && continue
+    local pid
+    pid=$(echo "${pipeline_json}" | jq -r '.id')
+    ((pipeline_count++))
+
+    fetch_pipeline_detail() {
+      safe_curl "${tmp_response}" \
+        -H "${auth_header}" \
+        "${api_base}/${project_id}/_apis/pipelines/${pid}?api-version=7.1"
+    }
+
+    if retry "pipeline detail ${pid} for [${project_name}]" fetch_pipeline_detail; then
+      jq -c '.' "${tmp_response}" >> "${pipeline_details}"
+    else
+      echo "====> WARNING: failed to fetch pipeline ${pid} detail"
+      echo "${pipeline_json}" >> "${pipeline_details}"
+    fi
+
+    sleep 0.2
+  done < "${all_pipelines}"
+
+  # Assemble final pipelines.json
+  jq -n \
+    --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg org "${ORGANIZATION}" \
+    --arg proj "${project_name}" \
+    --slurpfile items <(jq -s '.' "${pipeline_details}") '
+    {
+      "exportDate": $date,
+      "organization": $org,
+      "project": $proj,
+      "pipelineCount": ($items[0] | length),
+      "pipelines": $items[0]
+    }
+  ' > "${pipelines_dir}/pipelines.json"
+
+  echo "====> Exported ${pipeline_count} YAML pipelines for [${project_name}]"
+
+  # ── Step 2: Export classic build definitions ──
+  local all_definitions="${tmp_dir}/all_definitions.jsonl"
+  > "${all_definitions}"
+  continuation_token=""
+  page=0
+
+  while true; do
+    ((page++))
+    local url="${api_base}/${project_id}/_apis/build/definitions?api-version=7.1"
+    [[ -n "${continuation_token}" ]] && url="${url}&continuationToken=${continuation_token}"
+
+    fetch_definitions_page() {
+      safe_curl "${tmp_response}" \
+        -H "${auth_header}" \
+        "${url}"
+    }
+
+    if ! retry "build definitions page ${page} for [${project_name}]" fetch_definitions_page; then
+      echo "====> WARNING: failed to list build definitions for [${project_name}] (page ${page}), skipping"
+      break
+    fi
+
+    local page_count
+    page_count=$(jq '.value | length' "${tmp_response}")
+    jq -c '.value[]' "${tmp_response}" >> "${all_definitions}"
+
+    echo "====> Build definitions page ${page}: got ${page_count} definitions"
+
+    continuation_token=$(jq -r '.continuationToken // empty' "${tmp_response}")
+    if [[ -z "${continuation_token}" || "${page_count}" -eq 0 ]]; then
+      break
+    fi
+  done
+
+  # Fetch full definition for each
+  local definition_details="${tmp_dir}/definition_details.jsonl"
+  > "${definition_details}"
+  local def_count=0
+
+  while IFS= read -r def_json; do
+    [[ -z "${def_json}" ]] && continue
+    local did
+    did=$(echo "${def_json}" | jq -r '.id')
+    ((def_count++))
+
+    fetch_definition_detail() {
+      safe_curl "${tmp_response}" \
+        -H "${auth_header}" \
+        "${api_base}/${project_id}/_apis/build/definitions/${did}?api-version=7.1"
+    }
+
+    if retry "build definition ${did} for [${project_name}]" fetch_definition_detail; then
+      jq -c '.' "${tmp_response}" >> "${definition_details}"
+    else
+      echo "====> WARNING: failed to fetch build definition ${did} detail"
+      echo "${def_json}" >> "${definition_details}"
+    fi
+
+    sleep 0.2
+  done < "${all_definitions}"
+
+  # Assemble final build-definitions.json
+  jq -n \
+    --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg org "${ORGANIZATION}" \
+    --arg proj "${project_name}" \
+    --slurpfile items <(jq -s '.' "${definition_details}") '
+    {
+      "exportDate": $date,
+      "organization": $org,
+      "project": $proj,
+      "definitionCount": ($items[0] | length),
+      "definitions": $items[0]
+    }
+  ' > "${pipelines_dir}/build-definitions.json"
+
+  echo "====> Exported ${def_count} build definitions for [${project_name}]"
+  echo "====> Pipeline export complete for [${project_name}]: ${pipeline_count} pipelines, ${def_count} build definitions"
+  return 0
+}
+
+# export artifact feeds, packages and binaries for a project via Azure DevOps REST API
+# Downloads feed metadata, package metadata, and latest version binary for each package.
+# usage: export_artifacts <normalized_project_name> <project_id> <original_project_name>
+# For org-scoped feeds, call: export_artifacts_org
+function export_artifacts {
+  local project_dir_name="${1}"
+  local project_id="${2}"
+  local project_name="${3}"
+  local artifacts_dir="${BACKUP_DIRECTORY}/${project_dir_name}/artifacts"
+  local api_base="${ORGANIZATION}"
+  local auth_header="Authorization: Basic ${B64_PAT}"
+
+  echo "====> Exporting artifacts for project [${project_name}]"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "====> Simulate artifact export for [${project_name}] to ${artifacts_dir}"
+    return 0
+  fi
+
+  mkdir -p "${artifacts_dir}/packages"
+  mkdir -p "${artifacts_dir}/binaries"
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "${artifacts_dir}/.export_tmp.XXXXXX")
+  trap "rm -rf '${tmp_dir}'" RETURN
+
+  local tmp_response="${tmp_dir}/response.json"
+
+  # ── Step 1: List project-scoped feeds ──
+  fetch_feeds() {
+    safe_curl "${tmp_response}" \
+      -H "${auth_header}" \
+      "${api_base}/${project_id}/_apis/packaging/feeds?api-version=7.1"
+  }
+
+  if ! retry "list feeds for [${project_name}]" fetch_feeds; then
+    echo "====> WARNING: failed to list feeds for [${project_name}], skipping artifact export"
+    return 1
+  fi
+
+  local feed_count
+  feed_count=$(jq '.value | length' "${tmp_response}")
+  cp "${tmp_response}" "${artifacts_dir}/feeds.json"
+  echo "====> Found ${feed_count} feeds for [${project_name}]"
+
+  if [[ ${feed_count} -eq 0 ]]; then
+    return 0
+  fi
+
+  # ── Step 2: For each feed, list packages and download binaries ──
+  for feed_json in $(jq -c '.value[]' "${artifacts_dir}/feeds.json"); do
+    local feed_id feed_name
+    feed_id=$(echo "${feed_json}" | jq -r '.id')
+    feed_name=$(echo "${feed_json}" | jq -r '.name')
+    local safe_feed_name
+    safe_feed_name=$(echo "${feed_name}" | sed -e 's/[^A-Za-z0-9._\(\)-]/_/g')
+
+    echo "====> Processing feed [${feed_name}] (${feed_id})"
+
+    # List packages in feed (with pagination)
+    local all_packages="${tmp_dir}/packages_${safe_feed_name}.jsonl"
+    > "${all_packages}"
+    local skip=0
+    local batch_size=1000
+
+    while true; do
+      fetch_packages() {
+        safe_curl "${tmp_response}" \
+          -H "${auth_header}" \
+          "${api_base}/_apis/packaging/Feeds/${feed_id}/packages?\$top=${batch_size}&\$skip=${skip}&api-version=7.1"
+      }
+
+      if ! retry "packages for feed [${feed_name}] skip=${skip}" fetch_packages; then
+        echo "====> WARNING: failed to list packages for feed [${feed_name}], skipping"
+        break
+      fi
+
+      local pkg_page_count
+      pkg_page_count=$(jq '.value | length' "${tmp_response}")
+      jq -c '.value[]' "${tmp_response}" >> "${all_packages}"
+
+      if [[ ${pkg_page_count} -lt ${batch_size} ]]; then
+        break
+      fi
+      skip=$(( skip + batch_size ))
+    done
+
+    local total_packages
+    total_packages=$(wc -l < "${all_packages}" | tr -d ' ')
+    echo "====> Feed [${feed_name}]: ${total_packages} packages"
+
+    # For each package, get versions and download latest binary
+    local packages_output="${tmp_dir}/packages_detail_${safe_feed_name}.jsonl"
+    > "${packages_output}"
+    local pkg_num=0
+
+    while IFS= read -r pkg_json; do
+      [[ -z "${pkg_json}" ]] && continue
+      ((pkg_num++))
+
+      local pkg_id pkg_name pkg_protocol
+      pkg_id=$(echo "${pkg_json}" | jq -r '.id')
+      pkg_name=$(echo "${pkg_json}" | jq -r '.name')
+      pkg_protocol=$(echo "${pkg_json}" | jq -r '.protocolType')
+      local safe_pkg_name
+      safe_pkg_name=$(echo "${pkg_name}" | sed -e 's/[^A-Za-z0-9._\(\)-]/_/g')
+
+      # Fetch versions
+      fetch_versions() {
+        safe_curl "${tmp_response}" \
+          -H "${auth_header}" \
+          "${api_base}/_apis/packaging/Feeds/${feed_id}/Packages/${pkg_id}/versions?api-version=7.1"
+      }
+
+      if retry "versions for [${pkg_name}] in [${feed_name}]" fetch_versions; then
+        local versions_data
+        versions_data=$(jq -c '.' "${tmp_response}")
+        # Combine package info with versions
+        echo "${pkg_json}" | jq -c --argjson versions "${versions_data}" '. + {versions: $versions.value}' >> "${packages_output}"
+
+        # Download latest version binary
+        local latest_version
+        latest_version=$(echo "${versions_data}" | jq -r '.value[0].version // empty')
+
+        if [[ -n "${latest_version}" ]]; then
+          local binary_dir="${artifacts_dir}/binaries/${safe_feed_name}/${safe_pkg_name}/${latest_version}"
+          mkdir -p "${binary_dir}"
+
+          local download_url=""
+          case "${pkg_protocol}" in
+            NuGet)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/nuget/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            npm)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/npm/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            PyPI)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/pypi/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            Maven)
+              # Maven requires groupId/artifactId parsing — use the normalized name
+              local group_id artifact_id
+              group_id=$(echo "${pkg_name}" | cut -d: -f1 | tr '.' '/')
+              artifact_id=$(echo "${pkg_name}" | cut -d: -f2)
+              if [[ -n "${artifact_id}" ]]; then
+                download_url="${api_base}/_apis/packaging/feeds/${feed_id}/maven/${group_id}/${artifact_id}/${latest_version}/${artifact_id}-${latest_version}.jar/content"
+              fi
+              ;;
+            UPack)
+              # Universal packages — use az CLI
+              echo "====> Downloading Universal package [${pkg_name}] v${latest_version}..."
+              az artifacts universal download \
+                --organization "${ORGANIZATION}" \
+                --feed "${feed_name}" \
+                --name "${pkg_name}" \
+                --version "${latest_version}" \
+                --path "${binary_dir}" 2>/dev/null || \
+                echo "====> WARNING: failed to download Universal package [${pkg_name}]"
+              download_url=""
+              ;;
+            *)
+              echo "====> WARNING: unsupported protocol [${pkg_protocol}] for [${pkg_name}], skipping binary download"
+              download_url=""
+              ;;
+          esac
+
+          if [[ -n "${download_url}" ]]; then
+            local binary_file="${binary_dir}/${safe_pkg_name}.pkg"
+            download_binary() {
+              local http_code
+              http_code=$(curl -s -o "${binary_file}" -w "%{http_code}" \
+                -H "${auth_header}" \
+                -L "${download_url}") || return 1
+              [[ "${http_code}" == "200" ]] || {
+                rm -f "${binary_file}"
+                return 1
+              }
+            }
+
+            if ! retry "download binary [${pkg_name}] v${latest_version}" download_binary; then
+              echo "====> WARNING: failed to download binary for [${pkg_name}] v${latest_version}"
+            fi
+          fi
+        fi
+      else
+        echo "====> WARNING: failed to fetch versions for [${pkg_name}]"
+        echo "${pkg_json}" | jq -c '. + {versions: []}' >> "${packages_output}"
+      fi
+
+      # Progress every 25 packages
+      if (( pkg_num % 25 == 0 )); then
+        echo "====> Package progress: ${pkg_num}/${total_packages}"
+      fi
+
+      sleep 0.2
+    done < "${all_packages}"
+
+    # Write per-feed packages file
+    jq -n \
+      --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg feed "${feed_name}" \
+      --arg feed_id "${feed_id}" \
+      --slurpfile items <(jq -s '.' "${packages_output}") '
+      {
+        "exportDate": $date,
+        "feedName": $feed,
+        "feedId": $feed_id,
+        "packageCount": ($items[0] | length),
+        "packages": $items[0]
+      }
+    ' > "${artifacts_dir}/packages/${safe_feed_name}.json"
+
+    echo "====> Feed [${feed_name}]: exported ${pkg_num} packages"
+  done
+
+  local total_binary_size
+  total_binary_size=$(du -hs "${artifacts_dir}/binaries" 2>/dev/null | cut -f1)
+  echo "====> Artifact export complete for [${project_name}]: ${feed_count} feeds (binaries: ${total_binary_size:-0})"
+  return 0
+}
+
+# export org-scoped artifact feeds (not tied to any project)
+# usage: export_artifacts_org
+function export_artifacts_org {
+  local artifacts_dir="${BACKUP_DIRECTORY}/_organization/artifacts"
+  local api_base="${ORGANIZATION}"
+  local auth_header="Authorization: Basic ${B64_PAT}"
+
+  echo "=== Exporting org-scoped artifact feeds"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "=== Simulate org-scoped artifact export to ${artifacts_dir}"
+    return 0
+  fi
+
+  mkdir -p "${artifacts_dir}/packages"
+  mkdir -p "${artifacts_dir}/binaries"
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "${artifacts_dir}/.export_tmp.XXXXXX")
+  trap "rm -rf '${tmp_dir}'" RETURN
+
+  local tmp_response="${tmp_dir}/response.json"
+
+  # List org-scoped feeds (no project scope)
+  fetch_org_feeds() {
+    safe_curl "${tmp_response}" \
+      -H "${auth_header}" \
+      "${api_base}/_apis/packaging/feeds?api-version=7.1"
+  }
+
+  if ! retry "list org-scoped feeds" fetch_org_feeds; then
+    echo "=== WARNING: failed to list org-scoped feeds, skipping"
+    return 1
+  fi
+
+  # Filter to only org-scoped feeds (no project property)
+  jq '{value: [.value[] | select(.project == null)]}' "${tmp_response}" > "${artifacts_dir}/feeds.json"
+
+  local feed_count
+  feed_count=$(jq '.value | length' "${artifacts_dir}/feeds.json")
+  echo "=== Found ${feed_count} org-scoped feeds"
+
+  if [[ ${feed_count} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Process each org-scoped feed (same logic as project-scoped)
+  for feed_json in $(jq -c '.value[]' "${artifacts_dir}/feeds.json"); do
+    local feed_id feed_name
+    feed_id=$(echo "${feed_json}" | jq -r '.id')
+    feed_name=$(echo "${feed_json}" | jq -r '.name')
+    local safe_feed_name
+    safe_feed_name=$(echo "${feed_name}" | sed -e 's/[^A-Za-z0-9._\(\)-]/_/g')
+
+    echo "=== Processing org-scoped feed [${feed_name}] (${feed_id})"
+
+    local all_packages="${tmp_dir}/packages_${safe_feed_name}.jsonl"
+    > "${all_packages}"
+    local skip=0
+    local batch_size=1000
+
+    while true; do
+      fetch_packages() {
+        safe_curl "${tmp_response}" \
+          -H "${auth_header}" \
+          "${api_base}/_apis/packaging/Feeds/${feed_id}/packages?\$top=${batch_size}&\$skip=${skip}&api-version=7.1"
+      }
+
+      if ! retry "packages for org feed [${feed_name}] skip=${skip}" fetch_packages; then
+        echo "=== WARNING: failed to list packages for org feed [${feed_name}]"
+        break
+      fi
+
+      local pkg_page_count
+      pkg_page_count=$(jq '.value | length' "${tmp_response}")
+      jq -c '.value[]' "${tmp_response}" >> "${all_packages}"
+
+      if [[ ${pkg_page_count} -lt ${batch_size} ]]; then
+        break
+      fi
+      skip=$(( skip + batch_size ))
+    done
+
+    local total_packages
+    total_packages=$(wc -l < "${all_packages}" | tr -d ' ')
+    echo "=== Org feed [${feed_name}]: ${total_packages} packages"
+
+    local packages_output="${tmp_dir}/packages_detail_${safe_feed_name}.jsonl"
+    > "${packages_output}"
+    local pkg_num=0
+
+    while IFS= read -r pkg_json_line; do
+      [[ -z "${pkg_json_line}" ]] && continue
+      ((pkg_num++))
+
+      local pkg_id pkg_name pkg_protocol
+      pkg_id=$(echo "${pkg_json_line}" | jq -r '.id')
+      pkg_name=$(echo "${pkg_json_line}" | jq -r '.name')
+      pkg_protocol=$(echo "${pkg_json_line}" | jq -r '.protocolType')
+      local safe_pkg_name
+      safe_pkg_name=$(echo "${pkg_name}" | sed -e 's/[^A-Za-z0-9._\(\)-]/_/g')
+
+      fetch_versions() {
+        safe_curl "${tmp_response}" \
+          -H "${auth_header}" \
+          "${api_base}/_apis/packaging/Feeds/${feed_id}/Packages/${pkg_id}/versions?api-version=7.1"
+      }
+
+      if retry "versions for [${pkg_name}] in org feed [${feed_name}]" fetch_versions; then
+        local versions_data
+        versions_data=$(jq -c '.' "${tmp_response}")
+        echo "${pkg_json_line}" | jq -c --argjson versions "${versions_data}" '. + {versions: $versions.value}' >> "${packages_output}"
+
+        local latest_version
+        latest_version=$(echo "${versions_data}" | jq -r '.value[0].version // empty')
+
+        if [[ -n "${latest_version}" ]]; then
+          local binary_dir="${artifacts_dir}/binaries/${safe_feed_name}/${safe_pkg_name}/${latest_version}"
+          mkdir -p "${binary_dir}"
+
+          local download_url=""
+          case "${pkg_protocol}" in
+            NuGet)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/nuget/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            npm)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/npm/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            PyPI)
+              download_url="${api_base}/_apis/packaging/feeds/${feed_id}/pypi/packages/${pkg_name}/versions/${latest_version}/content"
+              ;;
+            Maven)
+              local group_id artifact_id
+              group_id=$(echo "${pkg_name}" | cut -d: -f1 | tr '.' '/')
+              artifact_id=$(echo "${pkg_name}" | cut -d: -f2)
+              if [[ -n "${artifact_id}" ]]; then
+                download_url="${api_base}/_apis/packaging/feeds/${feed_id}/maven/${group_id}/${artifact_id}/${latest_version}/${artifact_id}-${latest_version}.jar/content"
+              fi
+              ;;
+            UPack)
+              az artifacts universal download \
+                --organization "${ORGANIZATION}" \
+                --feed "${feed_name}" \
+                --name "${pkg_name}" \
+                --version "${latest_version}" \
+                --path "${binary_dir}" 2>/dev/null || \
+                echo "=== WARNING: failed to download Universal package [${pkg_name}]"
+              download_url=""
+              ;;
+            *)
+              download_url=""
+              ;;
+          esac
+
+          if [[ -n "${download_url}" ]]; then
+            local binary_file="${binary_dir}/${safe_pkg_name}.pkg"
+            download_binary() {
+              local http_code
+              http_code=$(curl -s -o "${binary_file}" -w "%{http_code}" \
+                -H "${auth_header}" \
+                -L "${download_url}") || return 1
+              [[ "${http_code}" == "200" ]] || {
+                rm -f "${binary_file}"
+                return 1
+              }
+            }
+
+            if ! retry "download binary [${pkg_name}] v${latest_version}" download_binary; then
+              echo "=== WARNING: failed to download binary for [${pkg_name}] v${latest_version}"
+            fi
+          fi
+        fi
+      else
+        echo "${pkg_json_line}" | jq -c '. + {versions: []}' >> "${packages_output}"
+      fi
+
+      if (( pkg_num % 25 == 0 )); then
+        echo "=== Package progress: ${pkg_num}/${total_packages}"
+      fi
+
+      sleep 0.2
+    done < "${all_packages}"
+
+    jq -n \
+      --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg feed "${feed_name}" \
+      --arg feed_id "${feed_id}" \
+      --slurpfile items <(jq -s '.' "${packages_output}") '
+      {
+        "exportDate": $date,
+        "feedName": $feed,
+        "feedId": $feed_id,
+        "packageCount": ($items[0] | length),
+        "packages": $items[0]
+      }
+    ' > "${artifacts_dir}/packages/${safe_feed_name}.json"
+
+    echo "=== Org feed [${feed_name}]: exported ${pkg_num} packages"
+  done
+
+  local total_binary_size
+  total_binary_size=$(du -hs "${artifacts_dir}/binaries" 2>/dev/null | cut -f1)
+  echo "=== Org-scoped artifact export complete: ${feed_count} feeds (binaries: ${total_binary_size:-0})"
+  return 0
+}
+
 
 ################################################################################
 ### MAIN
@@ -389,7 +1008,7 @@ for dep in "${deps[@]}"; do
 done
 
 # parse options
-while getopts ':p:d:o:r:vxwhnbs' option; do
+while getopts ':p:d:o:r:f:vxwhnbsal' option; do
   case "$option" in
     p) PAT=$OPTARG
        ;;
@@ -398,6 +1017,8 @@ while getopts ':p:d:o:r:vxwhnbs' option; do
     o) ORGANIZATION=$OPTARG
        ;;
     r) RETENTION_DAYS=$OPTARG
+       ;;
+    f) PROJECT_FILTER=$OPTARG
        ;;
     v) VERBOSE_MODE=true
        ;;
@@ -410,6 +1031,10 @@ while getopts ':p:d:o:r:vxwhnbs' option; do
     b) BACKLOG=true
        ;;
     s) SKIP_REPOS=true
+       ;;
+    a) ARTIFACTS=true
+       ;;
+    l) PIPELINES=true
        ;;
     h) usage
        exit 0
@@ -449,8 +1074,8 @@ shift $((OPTIND - 1))
 [[ ! -d "${BACKUP_ROOT_PATH}" ]] && die "Backup directory is not a directory"
 # die if directory is root (/)
 [[ "${BACKUP_ROOT_PATH}" == "/" ]] && die "Backup directory should not be root dir /"
-# die if skip repos is set without backlog
-[[ "${SKIP_REPOS}" == "true" && "${BACKLOG}" == "false" ]] && die_and_usage "Skip repos (-s) requires backlog (-b) to be enabled"
+# die if skip repos is set without any export mode
+[[ "${SKIP_REPOS}" == "true" && "${BACKLOG}" == "false" && "${PIPELINES}" == "false" && "${ARTIFACTS}" == "false" ]] && die_and_usage "Skip repos (-s) requires at least one of: backlog (-b), pipelines (-l), or artifacts (-a) to be enabled"
 # warn if skip repos and wiki are both set
 [[ "${SKIP_REPOS}" == "true" && "${PROJECT_WIKI}" == "true" ]] && echo "WARNING: -s (skip repos) and -w (wiki) are both set; wiki backup requires repo data and will be skipped"
 
@@ -472,6 +1097,9 @@ echo "VERBOSE_MODE      = ${VERBOSE_MODE}"
 echo "COMPRESS          = ${COMPRESS}"
 echo "BACKLOG           = ${BACKLOG}"
 echo "SKIP_REPOS        = ${SKIP_REPOS}"
+echo "PIPELINES         = ${PIPELINES}"
+echo "ARTIFACTS         = ${ARTIFACTS}"
+echo "PROJECT_FILTER    = ${PROJECT_FILTER:-all}"
 
 #Store script start time
 start_time=$(date +%s)
@@ -505,6 +1133,30 @@ if ! retry "fetch project list" fetch_project_list; then
   die "ERROR: empty project list after ${MAX_RETRIES} attempts, wrong azure cli parameters?"
 fi
 
+# Apply project filter if specified
+if [[ -n "${PROJECT_FILTER}" ]]; then
+  echo "=== Applying project filter: ${PROJECT_FILTER}"
+  # Build jq filter from comma-separated project names (case-insensitive)
+  IFS=',' read -ra FILTER_PROJECTS <<< "${PROJECT_FILTER}"
+  local_filter=""
+  for fp in "${FILTER_PROJECTS[@]}"; do
+    fp_trimmed=$(echo "${fp}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -n "${local_filter}" ]]; then
+      local_filter="${local_filter}, \"${fp_trimmed}\""
+    else
+      local_filter="\"${fp_trimmed}\""
+    fi
+  done
+  # Filter project list (case-insensitive match)
+  FilteredProjectList=$(echo "${ProjectList}" | jq --argjson names "[${local_filter}]" '[.[] | select(any($names[]; ascii_downcase == (.name | ascii_downcase)))]')
+  filtered_count=$(echo "${FilteredProjectList}" | jq 'length')
+  if [[ "${filtered_count}" -eq 0 ]]; then
+    die "ERROR: no projects matched filter [${PROJECT_FILTER}]. Available projects: $(echo "${ProjectList}" | jq -r '.[].name' | tr '\n' ', ')"
+  fi
+  echo "=== Filter matched ${filtered_count} project(s)"
+  ProjectList="${FilteredProjectList}"
+fi
+
 #Create backup folder with current time as name
 BACKUP_FOLDER=$(date +"%Y%m%d%H%M")
 BACKUP_DIRECTORY="${BACKUP_ROOT_PATH}/${BACKUP_FOLDER}"
@@ -532,6 +1184,11 @@ done
 #Initialize counters
 PROJECT_COUNTER=0
 REPO_COUNTER=0
+
+# Export org-scoped artifact feeds (once, before project loop)
+if [[ "${ARTIFACTS}" == "true" ]]; then
+  export_artifacts_org || echo "=== WARNING: org-scoped artifact export failed, continuing"
+fi
 
 # start process projects
 for project in $(echo "${ProjectList}" | jq -r '.[] | @base64'); do
@@ -616,6 +1273,16 @@ for project in $(echo "${ProjectList}" | jq -r '.[] | @base64'); do
   if [[ "${BACKLOG}" == "true" ]]; then
     export_backlog "${CURRENT_PROJECT_NAME}" "$(_jq '.id')" "$(_jq '.name')" || \
       echo "====> WARNING: backlog export failed for [$(_jq '.name')], continuing"
+  fi
+
+  if [[ "${PIPELINES}" == "true" ]]; then
+    export_pipelines "${CURRENT_PROJECT_NAME}" "$(_jq '.id')" "$(_jq '.name')" || \
+      echo "====> WARNING: pipeline export failed for [$(_jq '.name')], continuing"
+  fi
+
+  if [[ "${ARTIFACTS}" == "true" ]]; then
+    export_artifacts "${CURRENT_PROJECT_NAME}" "$(_jq '.id')" "$(_jq '.name')" || \
+      echo "====> WARNING: artifact export failed for [$(_jq '.name')], continuing"
   fi
 
   if [[ "${PROJECT_WIKI}" == "true" && "${SKIP_REPOS}" == "false" ]]; then

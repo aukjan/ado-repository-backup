@@ -52,9 +52,14 @@ Interaction with the Azure DevOps API requires a [personal access token](https:/
 
 For this backup script you need to generate a PAT with read access on Code. Using the pipeline doesn't require this configuration because the pipeline uses the internal SYSTEM_ACCESS_TOKEN of build agent itself.
 
+**Additional PAT scopes required for optional features:**
+- **Pipelines** (`-l`): Build (Read)
+- **Artifacts** (`-a`): Packaging (Read)
+- **Backlog** (`-b`): Work Items (Read)
+
 ### Usage:
 ```shell
-     ./backup-devops.sh [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n]
+     ./backup-devops.sh [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-f projects]
      where:
           -h  show this help text
           -p  personal access token (PAT) for Azure DevOps [REQUIRED]
@@ -64,8 +69,13 @@ For this backup script you need to generate a PAT with read access on Code. Usin
               A value of zero is accepted and keeps only the last daily backup
           -v  verbose mode [default is false]
           -x  dry run mode (no actual backup, only simulation) [default is false]
-          -w  backup project wiki [default is true]
+          -w  backup project wiki [default is false]
           -n  do not compress backup folder [default is true]
+          -b  backup backlog work items (exports via REST API as JSON) [default is false]
+          -s  skip repository cloning (use with -b/-l/-a for metadata-only mode) [default is false]
+          -l  backup pipeline definitions (YAML + classic as JSON) [default is false]
+          -a  backup artifact feeds, packages and binaries [default is false]
+          -f  filter projects: comma-separated list of project names to backup [default is all]
 ```
 
 ## :whale: Run with docker compose
@@ -193,4 +203,35 @@ adorepobck  | Elapsed time : 0 days 00 hr 00 min 18 sec
 adorepobck exited with code 0
 ~~~
 
+### Running individual services
 
+The compose file includes separate services for each backup mode. Run them individually:
+
+```shell
+# Backup only pipeline definitions
+docker compose up pipelines
+
+# Backup only artifact feeds and binaries
+docker compose up artifacts
+
+# Backup only backlog work items
+docker compose up backlog
+
+# Full backup (repos + wiki)
+docker compose up backup
+```
+
+### Project filtering
+
+To limit backup to specific projects, set `PROJECT_FILTER` in your `.env` file:
+
+```shell
+# .env
+PROJECT_FILTER=MyProject,AnotherProject
+```
+
+Or pass it directly:
+
+```shell
+PROJECT_FILTER=MyProject docker compose up pipelines
+```
