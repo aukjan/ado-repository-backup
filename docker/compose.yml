@@ -13,8 +13,29 @@ services:
       - RETENTION_DAYS=1
       - DRY_RUN=false
       - WIKI=true
-      - NOCOMPRESS=false
+      - NOCOMPRESS=true
+      - BACKLOG=false
       - VERBOSE=false
     volumes:
-      - ./data:/data
+      - ../../backups:/data
+
+  backlog:
+    container_name: adorepobck-backlog
+    image: adorepobck:latest
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DEVOPS_ORG_URL
+      - DEVOPS_PAT
+      - RETENTION_DAYS=1
+      - DRY_RUN=false
+      - WIKI=false
+      - NOCOMPRESS=true
+      - BACKLOG=true
+      - SKIP_REPOS=true
+      - VERBOSE=false
+    volumes:
+      - ../../backups:/data
 
