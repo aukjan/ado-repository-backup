@@ -73,7 +73,7 @@ If you don't want to install all those prerequisities or you want to isolate thi
 ### Istructions:
 
 ~~~shell
-$ git clone https://github.com/tomdess/ado-repository-backup.git
+$ git clone https://github.com/aukjan/ado-repository-backup.git
 
 $ cd ado-repository-backup
 ~~~
@@ -144,7 +144,7 @@ start docker container with compose:
  ✔ backup                Built                                                                                                                                                 0.0s 
  ✔ Container adorepobck  Recreated                                                                                                                                             0.1s 
 Attaching to adorepobck
-adorepobck  | INFO: running script ./backup-devops.sh -p 4ksuw5gXXPFdjhvb2QZk54NuIwiSylOMAU5vf5S8V72yTwvzACu2JQQJ99BDACAAAAAT1IdTAAASAZDO1vzZ -o https://dev.azure.com/MyOrg -d /data -r 1   -w
+adorepobck  | INFO: running script ./backup-devops.sh -p <YOUR_PAT_TOKEN> -o https://dev.azure.com/MyOrg -d /data -r 1   -w
 adorepobck  | === Azure DevOps Repository Backup Script ===
 adorepobck  | === Script parameters
 adorepobck  | ORGANIZATION_URL  = https://dev.azure.com/MyOrg
