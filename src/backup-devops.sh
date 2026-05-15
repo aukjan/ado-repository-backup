@@ -1274,7 +1274,6 @@ for project in $(echo "${ProjectList}" | jq -r '.[] | @base64'); do
           else
             if [[ "${INCLUDE_DISABLED}" == "true" ]]; then
               echo "====> Disabled repo detected: [${CURRENT_REPO_NAME}] — temporarily re-enabling"
-              local repo_id project_id_local tmp_patch
               repo_id=$(_jqR '.id')
               project_id_local=$(_jq '.id')
               tmp_patch=$(mktemp)
@@ -1295,7 +1294,7 @@ for project in $(echo "${ProjectList}" | jq -r '.[] | @base64'); do
                   rm -rf "${CURRENT_REPO_DIRECTORY}" 2>/dev/null
                   git -c http.extraHeader="Authorization: Basic ${B64_PAT}" clone "$(_jqR '.webUrl')" "${CURRENT_REPO_DIRECTORY}"
                 }
-                local clone_ok=true
+                clone_ok=true
                 if ! retry "clone repo [${CURRENT_REPO_NAME}]" clone_disabled_repo; then
                   echo "====> WARNING: clone failed for disabled repo [${CURRENT_REPO_NAME}]"
                   clone_ok=false
