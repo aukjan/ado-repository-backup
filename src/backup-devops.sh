@@ -618,7 +618,8 @@ function export_artifacts {
   fi
 
   # ── Step 2: For each feed, list packages and download binaries ──
-  for feed_json in $(jq -c '.value[]' "${artifacts_dir}/feeds.json"); do
+  while IFS= read -r feed_json; do
+    [[ -z "${feed_json}" ]] && continue
     local feed_id feed_name
     feed_id=$(echo "${feed_json}" | jq -r '.id')
     feed_name=$(echo "${feed_json}" | jq -r '.name')
@@ -779,7 +780,7 @@ function export_artifacts {
     ' > "${artifacts_dir}/packages/${safe_feed_name}.json"
 
     echo "====> Feed [${feed_name}]: exported ${pkg_num} packages"
-  done
+  done < <(jq -c '.value[]' "${artifacts_dir}/feeds.json")
 
   local total_binary_size
   total_binary_size=$(du -hs "${artifacts_dir}/binaries" 2>/dev/null | cut -f1)
@@ -836,7 +837,8 @@ function export_artifacts_org {
   fi
 
   # Process each org-scoped feed (same logic as project-scoped)
-  for feed_json in $(jq -c '.value[]' "${artifacts_dir}/feeds.json"); do
+  while IFS= read -r feed_json; do
+    [[ -z "${feed_json}" ]] && continue
     local feed_id feed_name
     feed_id=$(echo "${feed_json}" | jq -r '.id')
     feed_name=$(echo "${feed_json}" | jq -r '.name')
@@ -986,7 +988,7 @@ function export_artifacts_org {
     ' > "${artifacts_dir}/packages/${safe_feed_name}.json"
 
     echo "=== Org feed [${feed_name}]: exported ${pkg_num} packages"
-  done
+  done < <(jq -c '.value[]' "${artifacts_dir}/feeds.json")
 
   local total_binary_size
   total_binary_size=$(du -hs "${artifacts_dir}/binaries" 2>/dev/null | cut -f1)
