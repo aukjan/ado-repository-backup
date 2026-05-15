@@ -56,10 +56,11 @@ For this backup script you need to generate a PAT with read access on Code. Usin
 - **Pipelines** (`-l`): Build (Read)
 - **Artifacts** (`-a`): Packaging (Read)
 - **Backlog** (`-b`): Work Items (Read)
+- **Disabled repos** (`-e`): Code (Manage)
 
 ### Usage:
 ```shell
-     ./backup-devops.sh [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-f projects]
+     ./backup-devops.sh [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-e] [-f projects]
      where:
           -h  show this help text
           -p  personal access token (PAT) for Azure DevOps [REQUIRED]
@@ -75,6 +76,8 @@ For this backup script you need to generate a PAT with read access on Code. Usin
           -s  skip repository cloning (use with -b/-l/-a for metadata-only mode) [default is false]
           -l  backup pipeline definitions (YAML + classic as JSON) [default is false]
           -a  backup artifact feeds, packages and binaries [default is false]
+          -e  include disabled repos: temporarily re-enable, clone, then re-disable [default is false]
+              Requires PAT with Code (Manage) scope. Backup folder gets .disabled suffix
           -f  filter projects: comma-separated list of project names to backup [default is all]
 ```
 
@@ -234,4 +237,29 @@ Or pass it directly:
 
 ```shell
 PROJECT_FILTER=MyProject docker compose up pipelines
+```
+
+### Backing up disabled repositories
+
+By default, disabled repositories are skipped during backup. To include them, enable the `-e` flag (or set `INCLUDE_DISABLED=true` in your `.env` file).
+
+When enabled, the script will:
+1. Detect disabled repositories via the Azure DevOps API
+2. Temporarily re-enable the repository
+3. Clone it (the backup folder is suffixed with `.disabled`, e.g. `MyRepo.disabled/`)
+4. Re-disable the repository immediately after cloning
+
+The re-disable step always runs, even if the clone fails, to ensure repos are not left in an unintended state.
+
+> **Note:** This feature requires a PAT with **Code (Manage)** scope, which is a stronger permission than the default Code (Read). Only enable this if you need to back up disabled repositories.
+
+```shell
+# .env
+INCLUDE_DISABLED=true
+```
+
+Or pass it directly:
+
+```shell
+INCLUDE_DISABLED=true docker compose up backup
 ```
