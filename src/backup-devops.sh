@@ -17,6 +17,7 @@ BACKLOG=false;
 SKIP_REPOS=false;
 PIPELINES=false;
 ARTIFACTS=false;
+INCLUDE_DISABLED=false;
 PROJECT_FILTER="";
 
 # required options
@@ -55,7 +56,7 @@ function die_and_usage {
 
 # usage function
 function usage {
-  usage="$(basename "$0") [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-f projects]
+  usage="$(basename "$0") [-h] -p PAT -d backup-dir -o organization -r retention [-v] [-x] [-w] [-n] [-b] [-s] [-l] [-a] [-e] [-f projects]
 where:
     -h  show this help text
     -p  personal access token (PAT) for Azure DevOps [REQUIRED]
@@ -71,6 +72,8 @@ where:
     -s  skip repository cloning (use with -b/-l/-a for metadata-only mode) [default is false]
     -l  backup pipeline definitions (YAML + classic as JSON) [default is false]
     -a  backup artifact feeds, packages and binaries [default is false]
+    -e  include disabled repos: temporarily re-enable, clone, then re-disable [default is false]
+        Requires PAT with Code (Manage) scope. Backup folder gets .disabled suffix
     -f  filter projects: comma-separated list of project names to backup [default is all]"
   printf '%s\n' "${usage}"
 }
@@ -1011,7 +1014,7 @@ for dep in "${deps[@]}"; do
 done
 
 # parse options
-while getopts ':p:d:o:r:f:vxwhnbsal' option; do
+while getopts ':p:d:o:r:f:vxwhnbsale' option; do
   case "$option" in
     p) PAT=$OPTARG
        ;;
@@ -1038,6 +1041,8 @@ while getopts ':p:d:o:r:f:vxwhnbsal' option; do
     a) ARTIFACTS=true
        ;;
     l) PIPELINES=true
+       ;;
+    e) INCLUDE_DISABLED=true
        ;;
     h) usage
        exit 0
@@ -1102,6 +1107,7 @@ echo "BACKLOG           = ${BACKLOG}"
 echo "SKIP_REPOS        = ${SKIP_REPOS}"
 echo "PIPELINES         = ${PIPELINES}"
 echo "ARTIFACTS         = ${ARTIFACTS}"
+echo "INCLUDE_DISABLED  = ${INCLUDE_DISABLED}"
 echo "PROJECT_FILTER    = ${PROJECT_FILTER:-all}"
 
 #Store script start time
@@ -1266,7 +1272,59 @@ for project in $(echo "${ProjectList}" | jq -r '.[] | @base64'); do
               die "=== Backup failed for repo [${CURRENT_REPO_NAME}], exiting"
             fi
           else
-            echo "====> Skipping disabled repo: [${CURRENT_REPO_NAME}]"
+            if [[ "${INCLUDE_DISABLED}" == "true" ]]; then
+              echo "====> Disabled repo detected: [${CURRENT_REPO_NAME}] — temporarily re-enabling"
+              repo_id=$(_jqR '.id')
+              project_id_local=$(_jq '.id')
+              tmp_patch=$(mktemp)
+
+              # Re-enable the repository
+              enable_repo() {
+                safe_curl "${tmp_patch}" \
+                  -X PATCH \
+                  -H "Authorization: Basic ${B64_PAT}" \
+                  -H "Content-Type: application/json" \
+                  -d '{"isDisabled": false}' \
+                  "${ORGANIZATION}/${project_id_local}/_apis/git/repositories/${repo_id}?api-version=7.1"
+              }
+              if retry "enable disabled repo [${CURRENT_REPO_NAME}]" enable_repo; then
+                echo "====> Re-enabled repo [${CURRENT_REPO_NAME}], cloning..."
+                CURRENT_REPO_DIRECTORY="${CURRENT_REPO_DIRECTORY}.disabled"
+                clone_disabled_repo() {
+                  rm -rf "${CURRENT_REPO_DIRECTORY}" 2>/dev/null
+                  git -c http.extraHeader="Authorization: Basic ${B64_PAT}" clone "$(_jqR '.webUrl')" "${CURRENT_REPO_DIRECTORY}"
+                }
+                clone_ok=true
+                if ! retry "clone repo [${CURRENT_REPO_NAME}]" clone_disabled_repo; then
+                  echo "====> WARNING: clone failed for disabled repo [${CURRENT_REPO_NAME}]"
+                  clone_ok=false
+                fi
+                # Always re-disable the repository
+                echo "====> Re-disabling repo [${CURRENT_REPO_NAME}]"
+                disable_repo() {
+                  safe_curl "${tmp_patch}" \
+                    -X PATCH \
+                    -H "Authorization: Basic ${B64_PAT}" \
+                    -H "Content-Type: application/json" \
+                    -d '{"isDisabled": true}' \
+                    "${ORGANIZATION}/${project_id_local}/_apis/git/repositories/${repo_id}?api-version=7.1"
+                }
+                if retry "disable repo [${CURRENT_REPO_NAME}]" disable_repo; then
+                  echo "====> Repo [${CURRENT_REPO_NAME}] re-disabled successfully"
+                else
+                  echo "====> ERROR: failed to re-disable repo [${CURRENT_REPO_NAME}] — MANUAL ACTION REQUIRED"
+                fi
+                rm -f "${tmp_patch}"
+                if [[ "${clone_ok}" == "false" ]]; then
+                  echo "====> Continuing despite clone failure for disabled repo [${CURRENT_REPO_NAME}]"
+                fi
+              else
+                echo "====> WARNING: failed to re-enable disabled repo [${CURRENT_REPO_NAME}], skipping"
+                rm -f "${tmp_patch}"
+              fi
+            else
+              echo "====> Skipping disabled repo: [${CURRENT_REPO_NAME}]"
+            fi
           fi
       fi        
       ((REPO_COUNTER++))
