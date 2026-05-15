@@ -17,7 +17,7 @@ services:
       - BACKLOG=false
       - PIPELINES=false
       - ARTIFACTS=false
-      - INCLUDE_DISABLED=false
+      - INCLUDE_DISABLED=True
       - PROJECT_FILTER
       - VERBOSE=false
     volumes:
